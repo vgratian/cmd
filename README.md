@@ -5,7 +5,6 @@ These scripts are not always safe or stable, so use them with precaution.
 ## Overview
 
 ### [maild](maild)
-*requires*: `curl`, `sed`, `grep`, any notification applet (see below).
 
 Simple IMAPS maild daemon, checks for unread email messages:
 + creates deskop notifications with [xnotify](https://github.com/vgratian/xnotify) (change `$NOTIFIER` to use another notification command, e.g. `notify-send` or `xmessage`)
@@ -16,6 +15,15 @@ Simple IMAPS maild daemon, checks for unread email messages:
 + copy `maild.conf.def` to `maild.conf`
 + edit and add your accounts
 + start with `maild start` or run `maild help` for all options
+
+*requires*: `curl`, `sed`, `grep`, any notification applet (see above).
+
+### [tst](tst)
+
+Quickly initialize and edit code scripts in different languages.
+
+*requires*: `vim`
+
 
 ## License
 [GPLv3](https://www.gnu.org/licenses/gpl-3.0.en.html)
