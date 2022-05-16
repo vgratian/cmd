@@ -12,5 +12,10 @@ Simple IMAPS maild daemon, checks for unread email messages:
 + maintains a status file for each account (this is then read by my statusd (to-be-published))
 + logs every new message
 
+*usage*:
++ copy `maild.conf.def` to `maild.conf`
++ edit and add your accounts
++ start with `maild start` or run `maild help` for all options
+
 ## License
 [GPLv3](https://www.gnu.org/licenses/gpl-3.0.en.html)

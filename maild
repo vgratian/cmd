@@ -24,60 +24,6 @@ set -e	# terminate if any command fails
 #set -u	# terminate if an undeclared variable is used
 #set -o pipefail	# fail early in piped commands
 
-#---------------------  PARAMETERS ----------------------#
-#
-# The following 3 arrays hold data of your IMAP accounts.
-# For each account, you must add an element to each of the
-# 3 arrays and make sure they are in the correct order!
-
-# display name of each account (not used for authentication,
-# so any name is OK).
-ADDR=(
-	'name@example.com'
-	'username@sample.net'
-)
-
-# server address of each account
-SERVER=(
-    'mail.example.com:993'
-	'mail.sample.net:993'
-)
-
-# login name used for authentication
-LOGIN=(
-    'name'
-	'username'
-)
-
-# the directory where maild creates files.
-HOMEDIR="$HOME/mail"
-# file that holds the PID of running process
-PIDF="$HOMEDIR/maild.pid"
-# log file
-LOGF="$HOMEDIR/maild.log"
-# for each mail account, we create a status file
-# (containing the list of unread messages). the
-# file name of this account is $PREFIX + display
-# name of the account, as defined in $ADDR
-PREFIX='inbox'
-
-# frequency of checking mail in minutes
-FREQ=3
-
-# snooz emails at evening times (from 19:30 to 08:00)
-SNOOZH=19
-SNOOZM=30
-SNOOZD=750 # snooz duration in minutes
-
-# each time check last N messages
-N=10
-
-# command to invoke to create a desktop notification
-NOTIFIER=xnotify
-# note: the command is invoked with two arguments:
-#   NOTIFIER SENDER SUBJECT
-
-
 #------------------ GLOBAL VARIABLES --------------------#
 #------------------  DO NOT CHANGE!  --------------------#
 
@@ -378,13 +324,19 @@ _start() {
 			sleep ${FREQ}m &
 		fi
 		SLEEPPID=$!
-		wait $SLEEPPID || :  # don't let sleep exit code kill us
+		wait $SLEEPPID || :  # don't let sleep termination kill us
     done
 
     log "terminating"
 }
 
 #------------------   MAIN ROUTINE   --------------------#
+
+if ! . $0.conf; then
+	echo "can't load [$0.conf]"
+	echo "maybe you need to copy [$0.conf.def] to [$0.conf]"
+	exit 1
+fi
 
 case "$1" in
     help | --help | -h | '' )
