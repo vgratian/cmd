@@ -1,0 +1,398 @@
+#!/bin/env bash
+
+# Simple program that checks for unread emails in your
+# mailbox(es) and creates desktop notifications. Also,
+# for each email account, maild creates a file that
+# contains a list of all unread emails in the directory
+# $HOMEDIR. I use this file to display number of emails
+# on my DWM taskbar.
+#
+# Requirements:
+#   curl        - to send IMAPS requests
+#   xnotify     - to create desktop notifications
+#                 (https://gitlab.com/vgratian/xnotify/)
+#
+# Usage:
+#   Normally I run the program in 3 steps:
+#       (1) start the program with `maild start`
+#       (2) enter password for each account
+#       (3) send to background with `CTRL+z` & `bg`
+#
+
+set -e	# terminate if any command fails 
+#set -u	# terminate if an undeclared variable is used
+#set -o pipefail	# fail early in piped commands
+
+#---------------------  PARAMETERS ----------------------#
+#
+# The following 3 arrays hold data of your IMAP accounts.
+# For each account, you must add an element to each of the
+# 3 arrays and make sure they are in the correct order!
+
+# display name of each account (not used for authentication,
+# so any name is OK).
+ADDR=(
+	'name@example.com'
+	'username@sample.net'
+)
+
+# server address of each account
+SERVER=(
+    'mail.example.com:993'
+	'mail.sample.net:993'
+)
+
+# login name used for authentication
+LOGIN=(
+    'name'
+	'username'
+)
+
+# the directory where maild creates files.
+HOMEDIR="$HOME/mail"
+# file that holds the PID of running process
+PIDF="$HOMEDIR/maild.pid"
+# log file
+LOGF="$HOMEDIR/maild.log"
+# for each mail account, we create a status file
+# (containing the list of unread messages). the
+# file name of this account is $PREFIX + display
+# name of the account, as defined in $ADDR
+PREFIX='inbox'
+
+# frequency of checking mail in minutes
+FREQ=3
+
+# snooz emails at evening times (from 17:30 to 08:00)
+SNOOZH=17
+SNOOZM=30
+SNOOZD=690 # snooz duration in minutes
+
+# each time check last N messages
+N=10
+
+#------------------ GLOBAL VARIABLES --------------------#
+#------------------  DO NOT CHANGE!  --------------------#
+
+# sleep process PID (in case woken up by signal, we'll 
+# kill sleep, otherwise we create zombie processes)
+SLEEPPID=
+
+# array which will hold password of each account
+PASSW=(
+)
+
+# requests for inbox status or message header
+REQSTATUS='STATUS INBOX (MESSAGES UNSEEN)'
+REQHEADER='BODY.PEEK[HEADER.FIELDS (DATE FROM SUBJECT)]'
+
+
+#------------------ PROGRAM COMMANDS --------------------#
+#---------------- AND HELPER FUNCTIONS ------------------#
+
+# for each account, we will also create an associated array
+# that will hold a cache for checked messages.
+_usage() {
+    cat << EOF
+    Simple IMAPS mail daemon.
+
+    Note: the program always starts in foreground and
+    asks for password(s) interactively. After that you
+    can send it to the background manually.
+
+    Usage: $(basename $0) COMMAND
+
+    Commands:
+        start       starts the program
+        stop        stops the program
+        status      shows status
+        now         break sleep and check emails right now
+EOF
+}
+
+# send signal to daemon
+signal() {
+    [ ! -f $PIDF ] && echo "not running" && return 2
+    kill $1 $(cat $PIDF)
+}
+
+# check if daemon is running
+_status() {
+    signal -0 2> /dev/null
+    x=$?
+    echo "x=$x"
+	case $x in
+		0 ) echo "running" ;;
+		1 ) echo "crashed" ;;
+		2 ) echo "not running" ;;
+		* ) echo "unknown" ;;
+	esac
+}
+
+# stop maild if it's running
+_stop() {
+    signal
+}
+
+# send signal to wake up from sleep
+_now() {
+    signal -SIGUSR1
+}
+
+
+#------------ HELPER FUNCTIONS FOR 'START' --------------#
+
+log() {
+    printf '%-30s: [%d] %s\n' "$(date +%c)" $$ "$@" >> $LOGF
+}
+
+cleanup() {
+    log 'cleaning up'
+    rm $PIDF
+    trap - EXIT
+}
+
+wakeup() {
+    log 'woke up by signal'
+    if [ -n "$SLEEPPID" ]; then
+        kill $SLEEPPID && log 'killed sleep process'
+        SLEEPPID=
+    fi
+}
+
+# Remove whitespace from string
+# credit for trimming leading/trailing whitespace:
+# Mateusz Piotrowski (https://stackoverflow.com/a/3352015/7217517)
+trim() {
+    read s
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf "${s//[$'\t\r\n']}"
+}
+
+# Decode UTF-8 string, if we can't decode, just return the raw string
+# Example encoded string:
+#       ' =?UTF-8?Q?=D5=AD=D5=A1=D5=BC=D5=A8?='  -->  'խառը'
+#
+# Of course, using Python or Perl would be more reliable, but I did
+# not want to add a dependency. E.g.:
+#       echo $1 | perl -CS -MEncode -ne 'print decode("MIME-Header", $_)'
+#
+decode() {
+	read s
+	local d w p
+
+	for w in $s; do
+
+		p="${w::10}"
+
+		# guess encoding based on MIME prefix
+		case "${p^^}" in
+			# Q-encoding
+			'=?UTF-8?Q?' )
+				w="${w:10:-2}"
+				w="${w//=/'\x'}"
+				w="${w//_/' '}" ;;
+			# base64-ecoding
+			'=?UTF-8?B?' )
+				w=$( base64 -d <<< "${w:10:-2}" ) ;;
+		esac
+
+		d+=" $w"
+	done
+	printf "${d:1}"
+}
+
+# Fetch basic details about an email: date, sender and subject
+# arguments:
+#   - account index
+#   - email uuid
+check_email() {
+
+    log " -> fetching UID $2..."
+
+    local data
+    data=$( echo "-u ${LOGIN[$1]}:${PASSW[$1]}" | curl -sv --stderr - -K- \
+        imaps://$srv/INBOX -X "UID FETCH $2 ($REQHEADER)" | grep -P -A1 \
+        '^< (Date|From|Subject): ' )
+
+	[ $? -ne 0 ] && echo "  -> request failed" && return 1
+    [ -z "$data" ] && echo "  -> error: no data" && return 1
+
+    # parse fields
+    date=$( echo "$data" | grep '^< Date: ' | cut -sd' ' -f3- \
+         | trim | decode )
+    sender=$( echo "$data" | grep '^< From: ' | cut -sd' ' -f3- \
+         | trim | decode )
+    subject=$( echo "$data" | grep '^< Subject: ' | cut -sd' ' -f3- \
+         | trim | decode )
+    # subject may be split into two lines
+    subject+=$( echo "$data" | grep -A1 '^< Subject: ' | tail -1 \
+        | cut -sd'<' -f2- | trim | decode )
+
+    [ -z "$sender" ] && log "  -> error: no sender" && return 1
+
+	log "  + sender:  [$sender]"
+	log "  + subject: [$subject]"
+	log "  + date:    [$date]"
+	log ""
+
+	# simplify sender for notification
+    from=$(echo "$sender" | cut -sd'<' -f1) && from="${from%% }"
+    [ -z "$from" ] && from=$(echo "$sender" | cut -sd'<' -f2-) \
+        && from="${from%%>}"
+    [ -z "$from" ] && from="$sender"
+
+	# notify
+	xnotify "$from" "$subject"
+}
+
+
+# argument: account index
+# returns 1 on errors
+check_inbox() {
+    local -n cache=c$1
+
+    local psw="${PASSW[$1]}"
+    local usr="${LOGIN[$1]}"
+    local srv="${SERVER[$1]}"
+    local addr="${ADDR[$1]}"
+
+    log "checking INBOX [$usr @ $srv] [${psw//?/x}] .."
+
+    # check numbers of total and unseen messages
+    local -i total=0 unseen=0
+    read total unseen <<< $( echo "-u $usr:$psw" | curl -s -K- \
+		imaps://$srv -X "$REQSTATUS" | sed -E \
+        's|(.*)(MESSAGES )([0-9]+)( UNSEEN )([0-9]+)(.*)|\3 \5|' )
+    # example output:
+    # * STATUS INBOX (MESSAGES 3741 UNSEEN 0)
+
+    log " -> total: $total, unseen: $unseen"
+    
+    # TODO: terminate program if authentication error
+    [ -z "$total" ] || [ -z "$unseen" ] && return 1
+
+    # reset status file
+    local statusf="$HOMEDIR/$PREFIX.$addr"
+    > $statusf
+
+    # no new messages
+    [ $unseen -eq 0 ] && cache=() && return 0
+
+    # check last N messages
+    local line uid flags
+    local -i until=$(($total-$N))
+    unseen=0
+
+    log " -> checking messages [$total:$until]"
+
+    while read -r line; do
+		line="${line//[$'\t\r\n']}"
+		uid=$(echo "$line" | cut -sd' ' -f5 )
+		flags=$(echo "$line" | cut -sd' ' -f7- )
+        if [ -z "$uid" ]; then
+            continue
+        elif echo "$flags" | grep -q '\Seen'; then
+            [ "${cache[$uid]+_}" ] && unset cache[$uid]
+        elif [ ! "${cache[$uid]+_}" ]; then
+            cache[$uid]=
+            ((unseen+=1))
+        fi
+    done <<< $( echo "-u $usr:$psw" | curl -s -K- imaps://$srv/INBOX \
+        -X "FETCH $total:$until (UID FLAGS)")
+		# sed -E 's|\* [0-9]+ FETCH \(UID ([0-9]+) FLAGS \((.*)\)\)$|\1 \2|')
+    # example output
+    # * 3741 FETCH (UID 48428 FLAGS ())
+    # * 3740 FETCH (UID 48427 FLAGS (\Seen))
+    # * 3739 FETCH (UID 48421 FLAGS (\Answered \Seen))
+    # * 3738 FETCH (UID 48420 FLAGS (\Answered))
+
+    if [ $unseen -eq 0 ]; then
+        log " -> no new messages"
+    else
+        log " -> new $unseen messages"
+    fi
+
+    local date sender from subject
+
+    for uid in "${!cache[@]}"; do
+
+        # if we already have email details, only
+        # need to update status file
+        if [ -n "${cache[$uid]}" ]; then
+            echo "${cache[$uid]}" >> $statusf
+            continue
+        fi
+        
+        date= sender= from= subject=
+
+        check_email $1 $uid || continue
+
+        # store in cache and statusf
+		cache[$uid]=$(printf '(%-7d) %-32s [%s]: %s\n' \
+            "$uid" "$date" "$sender" "$subject")
+        echo "${cache[$uid]}" >> $statusf
+
+    done
+}
+
+_start() {
+    echo $$ >> $PIDF
+    trap cleanup EXIT
+    trap wakeup SIGUSR1
+    log "starting up (freq=${FREQ}m)"
+
+    # read password for each account
+    local -i i
+	local psw
+    #for addr in ${ADDR[@]}; do
+	for ((i=0; i<${#ADDR[@]}; i++)); do
+        read -rsp "password for [${ADDR[$i]}]: " psw
+		echo
+		echo "-u ${LOGIN[$i]}:${psw}" | curl imaps://${SERVER[$i]} \
+			-K- -m5 -# > /dev/null && echo -e '\e[1A\e[K OK' || exit $?
+        PASSW+=($psw)
+    	unset psw
+    done
+	echo "you can now send me to the background"
+
+    local -i n="${#ADDR[@]}"
+
+    # main loop
+    while true; do
+        for (( i=0; i<$n; i++ )); do
+            check_inbox $i
+        done
+
+		if [ $(date +%H) == $SNOOZH ] && [ $(date +%M) -ge $SNOOZM ]; then
+			log "snoozing $SNOOZD minutes..."
+			sleep ${SNOOZD}m &
+		else
+	        log "sleeping $FREQ m until next poll"
+	        sleep ${FREQ}m &
+		fi
+		SLEEPPID=$!
+		wait $SLEEPPID || :  # don't let sleep exit code kill us
+    done
+
+    log "terminating"
+}
+
+#------------------   MAIN ROUTINE   --------------------#
+
+case "$1" in
+    help | --help | -h | '' )
+        _usage ;;
+    status | stop | now )
+        _$1 ;;
+    start )
+        # initiate cache for each account, this is the only way
+        # I could create associated arrays dynamically
+        for (( i=0; i<${#ADDR[@]}; i++)); do declare -An "c$i"; done
+        unset i
+        _start ;;
+    * )
+        echo "invalid command: $1"
+        exit 1 ;;
+esac
